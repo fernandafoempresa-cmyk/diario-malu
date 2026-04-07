@@ -1,0 +1,1499 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Diário da Malu</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Serif+Display:ital@0;1&display=swap" rel="stylesheet">
+
+<!-- Firebase SDKs -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc,
+    collection, addDoc, getDocs, query, orderBy, onSnapshot, serverTimestamp }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+
+  // ════════════════════════════════════════════════════════
+  // ⚙️  CONFIGURAÇÃO FIREBASE — substitua com seus dados
+  // ════════════════════════════════════════════════════════
+  const firebaseConfig = {
+    apiKey:            "AIzaSyAS4mccqYv4nfECf85cWbqZzjlj78ExyRI",
+    authDomain:        "aplicativo-malu.firebaseapp.com",
+    projectId:         "aplicativo-malu",
+    storageBucket:     "aplicativo-malu.firebasestorage.app",
+    messagingSenderId: "769121926045",
+    appId:             "1:769121926045:web:e5ed24d068f4e604680d74",
+    measurementId:     "G-LQHB1FDQDY"
+  };
+
+  const IS_CONFIGURED = !firebaseConfig.apiKey.includes("COLE_AQUI");
+
+  let app, auth, db, storage;
+  if (IS_CONFIGURED) {
+    app     = initializeApp(firebaseConfig);
+    auth    = getAuth(app);
+    db      = getFirestore(app);
+    storage = getStorage(app);
+  }
+
+  // ── CONSTANTS ───────────────────────────────────────────
+  const CRISIS_CAUSES    = ["Menção à avó","Conflito na escola","Bullying","Frustração com limite","Cansaço/privação de sono","Mudança de rotina","Conflito com colegas","Redes sociais","Outro"];
+  const CRISIS_INTENSITY = ["Leve","Moderada","Intensa","Muito intensa"];
+  const MONTHS_PT        = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+  const DAYS_PT          = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+  const NOTE_CATS        = ["Geral","Comportamento","Escola","Família","Sono","Alimentação","Terapia","Médico"];
+  const DOC_TYPES        = ["Laudo médico","Receita","Teste neuropsicológico","Relatório escolar","Exame","Prescrição","Outro"];
+  const APPT_TYPES       = ["Consulta médica","Terapia","Psicologia","Neurologia","Psiquiatria","Escola","Exame","Outro"];
+  const TURNS            = ["Manhã","Tarde","Noite"];
+
+  // ── STATE ────────────────────────────────────────────────
+  let currentUser = null;
+  let appData = { crises:{}, meds:[], notes:{}, docs:[], shifts:{}, appointments:[] };
+  let calYear, calMonth;
+  const now = new Date();
+  calYear  = now.getFullYear();
+  calMonth = now.getMonth();
+  let modalDate = null;
+  let selIntensity = "Moderada";
+  let selCauses    = [];
+  let selNoteCat   = "Geral";
+  let medEditIdx   = null;
+  let chatHistory  = [];
+  let currentTab   = "calendar";
+
+  // ── SHARED DATA — banco único para todos os usuários ──────
+  function emptyData() { return { crises:{}, meds:[], notes:{}, docs:[], shifts:{}, appointments:[] }; }
+  function loadLocal()  { try { return JSON.parse(localStorage.getItem("malu_v2")) || emptyData(); } catch { return emptyData(); } }
+  function saveLocal(d) { localStorage.setItem("malu_v2", JSON.stringify(d)); }
+
+  // Perfil e permissões do usuário atual
+  let userProfile = { role:"viewer", approved:false, name:"" };
+  function canEdit() { return userProfile.approved && (userProfile.role==="admin"||userProfile.role==="editor"); }
+  function isAdmin() { return userProfile.approved && userProfile.role==="admin"; }
+
+  function applyPermissions() {
+    document.querySelectorAll(".edit-only").forEach(e => e.style.display = canEdit() ? "" : "none");
+    document.querySelectorAll(".admin-only").forEach(e => e.style.display = isAdmin() ? "" : "none");
+    const rb = el("user-role-badge");
+    if (rb) {
+      if (!userProfile.approved) { rb.textContent="⏳ Aguardando aprovação"; rb.style.color="#e87c8a"; }
+      else if (userProfile.role==="admin")  { rb.textContent="⭐ Admin"; rb.style.color="#f0c060"; }
+      else if (userProfile.role==="editor") { rb.textContent="✏️ Editor"; rb.style.color="#5ecfbf"; }
+      else { rb.textContent="👁 Somente leitura"; rb.style.color="#8899bb"; }
+    }
+    const pb = el("pending-banner");
+    if (pb) pb.style.display = (!userProfile.approved) ? "block" : "none";
+  }
+
+  async function loadUserProfile(uid) {
+    if (!IS_CONFIGURED || !db) {
+      userProfile = { role:"admin", approved:true, name:"Usuário local" };
+      return;
+    }
+    try {
+      const snap = await getDoc(doc(db,"malu","users",uid));
+      if (snap.exists()) {
+        userProfile = snap.data();
+      } else {
+        // Verifica se já existe algum admin aprovado
+        const usersSnap = await getDocs(collection(db,"malu","users"));
+        const hasAdmin = usersSnap.docs.some(d => d.data().role==="admin" && d.data().approved);
+        userProfile = {
+          role: hasAdmin ? "viewer" : "admin",
+          approved: !hasAdmin,
+          name: currentUser.displayName || currentUser.email,
+          email: currentUser.email,
+          createdAt: new Date().toISOString()
+        };
+        await setDoc(doc(db,"malu","users",uid), userProfile);
+      }
+    } catch(e) {
+      console.warn("Profile load:", e);
+      userProfile = { role:"viewer", approved:false, name: currentUser?.email||"" };
+    }
+  }
+
+  // ── FIREBASE HELPERS ─────────────────────────────────────
+  async function fbLoad() {
+    if (!IS_CONFIGURED || !db) return loadLocal();
+    try {
+      const snap = await getDoc(doc(db,"malu","data"));
+      const data = snap.exists() ? snap.data() : emptyData();
+      saveLocal(data);
+      return data;
+    } catch(e) { console.warn("FB load failed:", e); return loadLocal(); }
+  }
+  async function fbSave(d) {
+    saveLocal(d);
+    if (!IS_CONFIGURED || !db || !canEdit()) return;
+    try { await setDoc(doc(db,"malu","data"), d); } catch(e) { console.warn("FB save:", e); }
+  }
+  async function fbUploadFile(file, path) {
+    if (!IS_CONFIGURED || !storage) return null;
+    const r = ref(storage, path);
+    await uploadBytes(r, file);
+    return await getDownloadURL(r);
+  }
+  async function fbDeleteFile(path) {
+    if (!IS_CONFIGURED || !storage) return;
+    try { await deleteObject(ref(storage, path)); } catch {}
+  }
+
+  // ── DOM HELPERS ──────────────────────────────────────────
+  const el  = id => document.getElementById(id);
+  const set = (id, html) => { const e = el(id); if(e) e.innerHTML = html; };
+  const show = (id, v="block") => { const e = el(id); if(e) e.style.display = v; };
+  const hide = id => { const e = el(id); if(e) e.style.display = "none"; };
+  const val  = id => el(id)?.value || "";
+
+  function badge(text, color) {
+    return `<span class="badge" style="background:${color}22;color:${color}">${text}</span>`;
+  }
+  function intensityColor(i) {
+    if (i==="Muito intensa") return "#ff5566";
+    if (i==="Intensa")       return "#e87c8a";
+    if (i==="Moderada")      return "#f0c060";
+    return "#8899bb";
+  }
+  function dateKey(y,m,d) { return `${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`; }
+  function fmtDate(dk) {
+    const d = new Date(dk+"T12:00:00");
+    return d.getDate()+" de "+MONTHS_PT[d.getMonth()]+" de "+d.getFullYear();
+  }
+  function fmtDateShort(dk) {
+    const d = new Date(dk+"T12:00:00");
+    return d.getDate()+"/"+(d.getMonth()+1)+"/"+d.getFullYear();
+  }
+
+  // ── AUTH ─────────────────────────────────────────────────
+  function initAuth() {
+    if (!IS_CONFIGURED) {
+      show("config-banner");
+      show("login-screen","flex");
+      return;
+    }
+    onAuthStateChanged(auth, async user => {
+      if (user) {
+        currentUser = user;
+        await loadUserProfile(user.uid);
+        appData = await fbLoad();
+        hide("login-screen");
+        show("app");
+        const name = userProfile.name || user.displayName || user.email;
+        el("hello-name").textContent = "Olá, " + name;
+        applyPermissions();
+        switchTab("calendar");
+      } else {
+        currentUser = null;
+        userProfile = { role:"viewer", approved:false, name:"" };
+        hide("app");
+        show("login-screen","flex");
+      }
+    });
+  }
+
+  window.doLogin = async function() {
+    const u = val("inp-user"), p = val("inp-pass");
+    hide("login-err");
+    if (!IS_CONFIGURED) {
+      // Demo mode — local storage auth
+      const users = JSON.parse(localStorage.getItem("malu_users_v2") || "{}");
+      if (!Object.keys(users).length) {
+        users["admin@malu.app"] = { pass:"malu2025", name:"Administradora", role:"admin", approved:true };
+        localStorage.setItem("malu_users_v2", JSON.stringify(users));
+      }
+      if (!users[u])           { showLoginErr("Usuário não encontrado."); return; }
+      if (users[u].pass !== p) { showLoginErr("Senha incorreta."); return; }
+      if (!users[u].approved)  { showLoginErr("Conta aguardando aprovação do administrador."); return; }
+      currentUser = { uid:u, email:u, displayName:users[u].name };
+      userProfile  = { role:users[u].role||"viewer", approved:true, name:users[u].name };
+      appData = loadLocal();
+      hide("login-screen"); show("app");
+      el("hello-name").textContent = "Olá, " + users[u].name;
+      applyPermissions();
+      switchTab("calendar");
+      return;
+    }
+    try {
+      await signInWithEmailAndPassword(auth, u, p);
+    } catch(e) { showLoginErr("Email ou senha incorretos."); }
+  };
+
+  window.doRegister = async function() {
+    const name = val("inp-name"), u = val("inp-user"), p = val("inp-pass");
+    if (!name||!u||!p) { showLoginErr("Preencha todos os campos."); return; }
+    if (!IS_CONFIGURED) {
+      const users = JSON.parse(localStorage.getItem("malu_users_v2") || "{}");
+      if (users[u]) { showLoginErr("Email já cadastrado."); return; }
+      const hasAdmin = Object.values(users).some(x=>x.role==="admin"&&x.approved);
+      users[u] = { pass:p, name, role:"viewer", approved:!hasAdmin };
+      localStorage.setItem("malu_users_v2", JSON.stringify(users));
+      if (hasAdmin) showLoginErr("Conta criada! Aguarde aprovação do administrador.", "#5ecfbf");
+      else showLoginErr("Conta de admin criada! Pode entrar agora.", "#5ecfbf");
+      return;
+    }
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, u, p);
+      // Profile criado automaticamente em loadUserProfile() ao fazer login
+      showLoginErr("Conta criada! Faça login com seu email e senha.", "#5ecfbf");
+      // Atualiza o display name no Firebase Auth
+      await setDoc(doc(db,"malu","users",cred.user.uid), {
+        name, email:u, role:"viewer", approved:false, createdAt:new Date().toISOString()
+      });
+      await signOut(auth);
+    } catch(e) {
+      if (e.code==="auth/email-already-in-use") showLoginErr("Email já cadastrado.");
+      else if (e.code==="auth/weak-password")   showLoginErr("Senha fraca — mínimo 6 caracteres.");
+      else showLoginErr("Erro: "+e.message);
+    }
+  };
+
+  window.doLogout = async function() {
+    if (IS_CONFIGURED) await signOut(auth);
+    else { currentUser = null; hide("app"); show("login-screen","flex"); }
+  };
+
+  function showLoginErr(msg, color="#e87c8a") {
+    const e = el("login-err");
+    e.textContent = msg; e.style.color = color; show("login-err");
+  }
+
+  // ── TABS ─────────────────────────────────────────────────
+  window.switchTab = function(tab) {
+    currentTab = tab;
+    document.querySelectorAll(".page-tab").forEach(p => p.classList.add("page-hidden"));
+    document.querySelectorAll(".nav-btn[data-tab]").forEach(b => b.classList.toggle("active", b.dataset.tab===tab));
+    show("tab-"+tab);
+    const renders = {
+      calendar: renderCalendar, meds: renderMeds, notes: renderNotes,
+      docs: renderDocs, report: renderReport, shifts: renderShifts,
+      appointments: renderAppointments, users: renderUsers, ai: () => {}
+    };
+    renders[tab]?.();
+  };
+
+  // ── CALENDAR ─────────────────────────────────────────────
+  window.calPrev = function() { if(calMonth===0){calMonth=11;calYear--;}else calMonth--; renderCalendar(); };
+  window.calNext = function() { if(calMonth===11){calMonth=0;calYear++;}else calMonth++; renderCalendar(); };
+
+  function renderCalendar() {
+    el("cal-title").textContent = MONTHS_PT[calMonth]+" "+calYear;
+    const today = new Date();
+    const firstDay = new Date(calYear,calMonth,1).getDay();
+    const daysInMonth = new Date(calYear,calMonth+1,0).getDate();
+    const daysInPrev  = new Date(calYear,calMonth,0).getDate();
+
+    const monthCrises = {};
+    Object.entries(appData.crises||{}).forEach(([k,v])=>{
+      const d = new Date(k+"T12:00:00");
+      if(d.getFullYear()===calYear && d.getMonth()===calMonth) monthCrises[d.getDate()]=v;
+    });
+    const monthShifts = {};
+    Object.entries(appData.shifts||{}).forEach(([k,v])=>{
+      const d = new Date(k+"T12:00:00");
+      if(d.getFullYear()===calYear && d.getMonth()===calMonth) monthShifts[d.getDate()]=v;
+    });
+    const monthAppts = {};
+    (appData.appointments||[]).forEach(a=>{
+      const d = new Date(a.date+"T12:00:00");
+      if(d.getFullYear()===calYear && d.getMonth()===calMonth){
+        if(!monthAppts[d.getDate()]) monthAppts[d.getDate()]=[];
+        monthAppts[d.getDate()].push(a);
+      }
+    });
+
+    const criseDays = Object.keys(monthCrises).length;
+    set("cal-stats",`
+      <div class="stat-box"><div class="stat-val" style="color:#e87c8a">${criseDays}</div><div class="stat-lbl">Dias com crise</div></div>
+      <div class="stat-box"><div class="stat-val" style="color:#5ecfbf">${daysInMonth-criseDays}</div><div class="stat-lbl">Dias estáveis</div></div>
+      <div class="stat-box"><div class="stat-val" style="color:#f0c060">${(appData.appointments||[]).filter(a=>{const d=new Date(a.date+"T12:00:00");return d.getFullYear()===calYear&&d.getMonth()===calMonth;}).length}</div><div class="stat-lbl">Compromissos</div></div>
+    `);
+
+    set("cal-dow", DAYS_PT.map(d=>`<div class="cal-dow">${d}</div>`).join(""));
+
+    const cells=[];
+    for(let i=firstDay-1;i>=0;i--) cells.push({day:daysInPrev-i,other:true});
+    for(let d=1;d<=daysInMonth;d++) cells.push({day:d,other:false});
+    while(cells.length%7!==0) cells.push({day:cells.length-daysInMonth-firstDay+1,other:true});
+
+    set("cal-cells", cells.map(c=>{
+      if(c.other) return `<div class="cal-day other-month">${c.day}</div>`;
+      const isToday = c.day===today.getDate()&&calMonth===today.getMonth()&&calYear===today.getFullYear();
+      const crisis = monthCrises[c.day];
+      const appts  = monthAppts[c.day];
+      const shift  = monthShifts[c.day];
+      const dk = dateKey(calYear,calMonth,c.day);
+      let cls = "cal-day";
+      if(crisis) cls+=" has-crisis";
+      if(isToday) cls+=" is-today";
+      const dots = [
+        crisis ? `<div class="cal-dot" style="background:${intensityColor(crisis.intensity)}"></div>` : "",
+        appts?.length ? `<div class="cal-dot" style="background:#a78bfa"></div>` : "",
+        shift ? `<div class="cal-dot" style="background:#5ecfbf;opacity:.6"></div>` : "",
+      ].join("");
+      return `<div class="${cls}" onclick="openModal('${dk}')">${c.day}<div class="cal-dots">${dots}</div></div>`;
+    }).join(""));
+
+    // crisis list
+    const listEl = el("cal-crisis-list");
+    if(!criseDays){listEl.innerHTML="";return;}
+    listEl.innerHTML=`<div class="card"><div class="card-title">Crises este mês</div>
+      ${Object.entries(monthCrises).sort((a,b)=>+a[0]-+b[0]).map(([day,c])=>`
+        <div class="crisis-item">
+          <div class="row-between mb6"><span class="fw6">Dia ${day}</span>${badge(c.intensity,intensityColor(c.intensity))}</div>
+          ${c.causes?.length?`<div class="text-sub">${c.causes.join(", ")}</div>`:""}
+          ${c.note?`<div class="text-muted italic mt4">${c.note}</div>`:""}
+        </div>`).join("")}
+    </div>`;
+  }
+
+  // ── CRISIS MODAL ─────────────────────────────────────────
+  window.openModal = function(dk) {
+    modalDate = dk;
+    const ex = appData.crises[dk]||null;
+    el("modal-date-title").textContent = "📅 "+fmtDate(dk);
+    show("modal-delete-btn", ex?"inline-block":"none");
+    selIntensity = ex?.intensity||"Moderada";
+    selCauses    = [...(ex?.causes||[])];
+    el("modal-duration").value   = ex?.duration||"";
+    el("modal-techniques").value = ex?.techniques||"";
+    el("modal-post").value       = ex?.postCrisis||"";
+    el("modal-note").value       = ex?.note||"";
+    renderModalIntensity(); renderModalCauses();
+    el("modal-overlay").classList.add("open");
+  };
+
+  function renderModalIntensity() {
+    set("modal-intensity", CRISIS_INTENSITY.map(i=>
+      `<span class="tag ${i===selIntensity?"active":""}" onclick="pickIntensity('${i}')">${i}</span>`
+    ).join(""));
+  }
+  function renderModalCauses() {
+    set("modal-causes", CRISIS_CAUSES.map(c=>
+      `<span class="tag ${selCauses.includes(c)?"active":""}" onclick="toggleCause('${c}')">${c}</span>`
+    ).join(""));
+  }
+  window.pickIntensity = i => { selIntensity=i; renderModalIntensity(); };
+  window.toggleCause   = c => { if(selCauses.includes(c)) selCauses=selCauses.filter(x=>x!==c); else selCauses.push(c); renderModalCauses(); };
+  window.saveCrisis    = async function() {
+    appData.crises[modalDate] = { intensity:selIntensity, causes:selCauses, duration:val("modal-duration"), techniques:val("modal-techniques"), postCrisis:val("modal-post"), note:val("modal-note") };
+    await fbSave(appData); closeModal(); renderCalendar();
+  };
+  window.deleteCrisis  = async function() { delete appData.crises[modalDate]; await fbSave(appData); closeModal(); renderCalendar(); };
+  window.closeModal    = () => el("modal-overlay").classList.remove("open");
+  window.closeModalOutside = e => { if(e.target===el("modal-overlay")) closeModal(); };
+
+  // ── MEDS ─────────────────────────────────────────────────
+  window.toggleMedForm = function(idx) {
+    medEditIdx = idx!==undefined?idx:null;
+    const f = el("med-form");
+    if(f.style.display==="none"||idx!==undefined){
+      f.style.display="block";
+      if(idx!==undefined){
+        const m=appData.meds[idx];
+        el("med-name").value=m.name||""; el("med-dose").value=m.dose||"";
+        el("med-times").value=m.times||"1"; el("med-start").value=m.startDate||"";
+        el("med-status").value=m.status||"ativo"; el("med-notes").value=m.notes||"";
+        el("med-form-title").textContent="Editar medicamento";
+      } else {
+        ["med-name","med-dose","med-start","med-notes"].forEach(id=>el(id).value="");
+        el("med-times").value="1"; el("med-status").value="ativo";
+        el("med-form-title").textContent="Novo medicamento";
+      }
+    } else f.style.display="none";
+  };
+  window.cancelMedForm = () => { el("med-form").style.display="none"; medEditIdx=null; };
+  window.saveMed = async function() {
+    const m={ name:val("med-name"), dose:val("med-dose"), times:val("med-times"), startDate:val("med-start"), status:val("med-status"), notes:val("med-notes"), updatedAt:new Date().toISOString() };
+    if(!m.name) return;
+    if(medEditIdx!==null) appData.meds[medEditIdx]=m; else appData.meds.push(m);
+    await fbSave(appData); cancelMedForm(); renderMeds();
+  };
+  window.removeMed = async function(i) { appData.meds.splice(i,1); await fbSave(appData); renderMeds(); };
+  window.editMed   = i => toggleMedForm(i);
+
+  function renderMeds() {
+    const meds = appData.meds||[];
+    const active   = meds.map((m,i)=>({...m,i})).filter(m=>m.status==="ativo");
+    const inactive = meds.map((m,i)=>({...m,i})).filter(m=>m.status!=="ativo");
+    el("meds-empty").style.display = meds.length?"none":"block";
+    set("meds-active", active.length?`<div class="card"><div class="card-title" style="color:#5ecfbf">Em uso atual</div>${active.map(medRow).join("")}</div>`:"");
+    set("meds-inactive", inactive.length?`<div class="card"><div class="card-title" style="color:var(--muted)">Histórico</div>${inactive.map(m=>medRow(m,true)).join("")}</div>`:"");
+  }
+
+  function medRow(m, dim=false) {
+    const started = m.startDate?` · Desde ${new Date(m.startDate+"T12:00:00").toLocaleDateString("pt-BR")}`:"";
+    return `<div class="med-item ${dim?"med-dim":""}">
+      <div><div class="fw7 fs16">${m.name} ${dim?badge(m.status,"var(--muted)"):""}</div>
+      <div class="text-sub">${m.dose} · ${m.times}x ao dia${started}</div>
+      ${m.notes?`<div class="text-muted italic fs12">${m.notes}</div>`:""}</div>
+      <div class="row-gap6 edit-only">
+        <button class="btn-secondary btn-sm" onclick="editMed(${m.i})">✏</button>
+        <button class="btn-danger" onclick="removeMed(${m.i})">✕</button>
+      </div></div>`;
+  }
+
+  // ── NOTES ────────────────────────────────────────────────
+  function renderNoteCatTags() {
+    set("note-cats", NOTE_CATS.map(c=>
+      `<span class="tag ${c===selNoteCat?"active":""}" onclick="pickNoteCat('${c}')">${c}</span>`
+    ).join(""));
+  }
+  window.pickNoteCat = c => { selNoteCat=c; renderNoteCatTags(); };
+  window.addNote = async function() {
+    const text = val("note-text").trim(); if(!text) return;
+    const key = Date.now().toString();
+    appData.notes = appData.notes||{};
+    appData.notes[key] = { text, category:selNoteCat, date:new Date().toISOString() };
+    await fbSave(appData); el("note-text").value=""; renderNotes();
+  };
+  window.removeNote = async function(k) { delete appData.notes[k]; await fbSave(appData); renderNotes(); };
+
+  function renderNotes() {
+    renderNoteCatTags();
+    const notes = Object.entries(appData.notes||{}).sort((a,b)=>b[0].localeCompare(a[0]));
+    set("notes-list", notes.map(([k,n])=>{
+      const d = new Date(n.date);
+      return `<div class="card note-item">
+        <div class="row-between mb8">
+          <div class="row-gap8">${badge(n.category,"#5ecfbf")}
+            <span class="fs12 text-muted">${d.toLocaleDateString("pt-BR")} às ${d.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"})}</span>
+          </div>
+          <button class="btn-danger edit-only" onclick="removeNote('${k}')">✕</button>
+        </div>
+        <div class="note-text">${n.text.replace(/\n/g,"<br>")}</div>
+      </div>`;
+    }).join(""));
+  }
+
+  // ── DOCUMENTS ────────────────────────────────────────────
+  window.handleDocUpload = async function() {
+    const file = el("doc-file").files[0];
+    const type = val("doc-type");
+    const title = val("doc-title").trim()||file?.name||"Documento";
+    const desc  = val("doc-desc").trim();
+    const dateVal = val("doc-date");
+    if(!file) { alert("Selecione um arquivo."); return; }
+
+    const btn = el("doc-upload-btn");
+    btn.textContent = "Enviando..."; btn.disabled = true;
+
+    let url = null, filePath = null;
+    if(IS_CONFIGURED && storage) {
+      filePath = `docs/${currentUser.uid}/${Date.now()}_${file.name}`;
+      url = await fbUploadFile(file, filePath);
+    } else {
+      // local: store as base64
+      url = await new Promise(res => {
+        const r = new FileReader(); r.onload = ()=>res(r.result); r.readAsDataURL(file);
+      });
+    }
+
+    appData.docs = appData.docs||[];
+    appData.docs.push({ id:Date.now().toString(), title, type, desc, date:dateVal||new Date().toISOString().split("T")[0], url, filePath, fileName:file.name, fileType:file.type, uploadedAt:new Date().toISOString() });
+    await fbSave(appData);
+    btn.textContent="Anexar arquivo"; btn.disabled=false;
+    el("doc-file").value=""; el("doc-title").value=""; el("doc-desc").value="";
+    el("doc-form").style.display="none";
+    renderDocs();
+  };
+
+  window.removeDoc = async function(id) {
+    const doc = appData.docs.find(d=>d.id===id);
+    if(doc?.filePath) await fbDeleteFile(doc.filePath);
+    appData.docs = appData.docs.filter(d=>d.id!==id);
+    await fbSave(appData); renderDocs();
+  };
+
+  function renderDocs() {
+    const docs = appData.docs||[];
+    el("docs-empty").style.display = docs.length?"none":"block";
+    const byType = {};
+    docs.forEach(d=>{ if(!byType[d.type]) byType[d.type]=[]; byType[d.type].push(d); });
+    set("docs-list", Object.entries(byType).map(([type, items])=>`
+      <div class="card">
+        <div class="card-title">${type}</div>
+        ${items.sort((a,b)=>b.date.localeCompare(a.date)).map(d=>`
+          <div class="doc-item">
+            <div class="doc-icon">${d.fileType?.includes("pdf")?"📄":"🖼️"}</div>
+            <div class="doc-info">
+              <div class="fw6">${d.title}</div>
+              <div class="text-sub fs12">${fmtDateShort(d.date)}${d.desc?" · "+d.desc:""}</div>
+            </div>
+            <div class="row-gap6">
+              <a href="${d.url}" target="_blank" class="btn-secondary btn-sm" style="text-decoration:none;display:inline-block">Ver</a>
+              <button class="btn-danger" onclick="removeDoc('${d.id}')">✕</button>
+            </div>
+          </div>`).join("")}
+      </div>`).join(""));
+  }
+
+  // ── SHIFTS (PLANTÃO) ─────────────────────────────────────
+  window.saveShift = async function() {
+    const date  = val("shift-date");
+    const turn  = val("shift-turn");
+    const person= val("shift-person").trim();
+    const notes = val("shift-notes").trim();
+    if(!date||!person) return;
+    if(!appData.shifts) appData.shifts={};
+    if(!appData.shifts[date]) appData.shifts[date]={};
+    appData.shifts[date][turn] = { person, notes };
+    await fbSave(appData);
+    el("shift-person").value=""; el("shift-notes").value="";
+    renderShifts();
+  };
+  window.removeShift = async function(date, turn) {
+    if(appData.shifts?.[date]?.[turn]) delete appData.shifts[date][turn];
+    if(appData.shifts?.[date] && !Object.keys(appData.shifts[date]).length) delete appData.shifts[date];
+    await fbSave(appData); renderShifts();
+  };
+
+  function renderShifts() {
+    const shifts = appData.shifts||{};
+    const sorted = Object.entries(shifts).sort((a,b)=>b[0].localeCompare(a[0]));
+    if(!sorted.length){ set("shifts-list",`<div class="card" style="text-align:center;color:var(--muted);padding:40px">Nenhum plantão registrado ainda.</div>`); return; }
+    set("shifts-list", sorted.map(([date,turns])=>`
+      <div class="card">
+        <div class="card-title">${fmtDate(date)}</div>
+        <div class="shifts-grid">
+          ${TURNS.map(t=>{
+            const s=turns[t];
+            return `<div class="shift-turn ${s?"shift-filled":"shift-empty"}">
+              <div class="shift-turn-label">${t==="Manhã"?"🌅":t==="Tarde"?"☀️":"🌙"} ${t}</div>
+              ${s?`<div class="shift-person">${s.person}</div>${s.notes?`<div class="shift-note">${s.notes}</div>`:""}
+                <button class="btn-danger" style="margin-top:6px;font-size:11px" onclick="removeShift('${date}','${t}')">Remover</button>` :
+                `<div class="text-muted fs12">—</div>`}
+            </div>`;
+          }).join("")}
+        </div>
+      </div>`).join(""));
+  }
+
+  // ── APPOINTMENTS ─────────────────────────────────────────
+  window.saveAppointment = async function() {
+    const date = val("appt-date"), time=val("appt-time"), type=val("appt-type");
+    const professional=val("appt-prof").trim(), location=val("appt-loc").trim(), notes=val("appt-anotes").trim();
+    if(!date||!type) return;
+    if(!appData.appointments) appData.appointments=[];
+    appData.appointments.push({ id:Date.now().toString(), date, time, type, professional, location, notes, createdAt:new Date().toISOString() });
+    await fbSave(appData);
+    ["appt-date","appt-time","appt-prof","appt-loc","appt-anotes"].forEach(id=>el(id).value="");
+    el("appt-form").style.display="none";
+    renderAppointments();
+  };
+  window.removeAppt = async function(id) {
+    appData.appointments=(appData.appointments||[]).filter(a=>a.id!==id);
+    await fbSave(appData); renderAppointments();
+  };
+
+  function renderAppointments() {
+    const appts = [...(appData.appointments||[])].sort((a,b)=>a.date.localeCompare(b.date)||a.time?.localeCompare(b.time||""));
+    const today = new Date().toISOString().split("T")[0];
+    const upcoming = appts.filter(a=>a.date>=today);
+    const past     = appts.filter(a=>a.date<today);
+
+    function apptCard(a) {
+      const d = new Date(a.date+"T12:00:00");
+      const isPast = a.date < today;
+      return `<div class="appt-item ${isPast?"appt-past":""}">
+        <div class="appt-date-col">
+          <div class="appt-day">${d.getDate()}</div>
+          <div class="appt-mon">${MONTHS_PT[d.getMonth()].slice(0,3)}</div>
+          ${a.time?`<div class="appt-time">${a.time}</div>`:""}
+        </div>
+        <div class="appt-info">
+          <div class="fw6">${a.type}</div>
+          ${a.professional?`<div class="text-sub fs13">${a.professional}</div>`:""}
+          ${a.location?`<div class="text-muted fs12">📍 ${a.location}</div>`:""}
+          ${a.notes?`<div class="text-muted fs12 italic">${a.notes}</div>`:""}
+        </div>
+        <button class="btn-danger" onclick="removeAppt('${a.id}')">✕</button>
+      </div>`;
+    }
+
+    set("appts-upcoming", upcoming.length?upcoming.map(apptCard).join(""):
+      `<div style="text-align:center;color:var(--muted);padding:24px;font-size:14px">Nenhum compromisso futuro.</div>`);
+    set("appts-past", past.length?`<div class="card"><div class="card-title text-muted">Histórico</div>${past.reverse().map(apptCard).join("")}</div>`:"");
+  }
+
+  // ── REPORT ───────────────────────────────────────────────
+  function initReportSelects() {
+    const ms = el("rep-month");
+    if(!ms.options.length){ MONTHS_PT.forEach((m,i)=>ms.appendChild(new Option(m,i))); ms.value=now.getMonth(); }
+  }
+  window.renderReport = function() {
+    initReportSelects();
+    const month=+val("rep-month"), year=+val("rep-year");
+    const mode  = val("rep-mode");
+    const fromD = val("rep-from"), toD = val("rep-to");
+
+    let crises=[], notes=[], appts=[], meds=appData.meds||[];
+
+    if(mode==="month") {
+      const dim = new Date(year,month+1,0).getDate();
+      Object.entries(appData.crises||{}).forEach(([k,v])=>{
+        const d=new Date(k+"T12:00:00");
+        if(d.getFullYear()===year&&d.getMonth()===month) crises.push([k,v]);
+      });
+      Object.entries(appData.notes||{}).forEach(([k,v])=>{
+        const d=new Date(v.date); if(d.getFullYear()===year&&d.getMonth()===month) notes.push([k,v]);
+      });
+      (appData.appointments||[]).forEach(a=>{
+        const d=new Date(a.date+"T12:00:00"); if(d.getFullYear()===year&&d.getMonth()===month) appts.push(a);
+      });
+    } else if(fromD&&toD) {
+      Object.entries(appData.crises||{}).forEach(([k,v])=>{ if(k>=fromD&&k<=toD) crises.push([k,v]); });
+      Object.entries(appData.notes||{}).forEach(([k,v])=>{ const ds=v.date.split("T")[0]; if(ds>=fromD&&ds<=toD) notes.push([k,v]); });
+      (appData.appointments||[]).forEach(a=>{ if(a.date>=fromD&&a.date<=toD) appts.push(a); });
+    }
+
+    const causeCounts={}, intCounts={};
+    crises.forEach(([,c])=>{ (c.causes||[]).forEach(x=>causeCounts[x]=(causeCounts[x]||0)+1); intCounts[c.intensity]=(intCounts[c.intensity]||0)+1; });
+    const activeMeds = meds.filter(m=>m.status==="ativo");
+
+    const periodLabel = mode==="month"?MONTHS_PT[month]+" "+year:`${fmtDateShort(fromD)} a ${fmtDateShort(toD)}`;
+
+    set("rep-content",`
+      <div class="card" style="border-color:#5ecfbf33;background:linear-gradient(135deg,#181c27,#1a2230)">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:4px">Resumo do período</div>
+        <div style="font-size:22px;font-weight:700;margin-bottom:16px">${periodLabel}</div>
+        <div class="stats-strip">
+          <div class="stat-box"><div class="stat-val" style="color:#e87c8a">${crises.length}</div><div class="stat-lbl">Dias com crise</div></div>
+          <div class="stat-box"><div class="stat-val" style="color:#5ecfbf">${activeMeds.length}</div><div class="stat-lbl">Medicamentos</div></div>
+          <div class="stat-box"><div class="stat-val" style="color:#a78bfa">${appts.length}</div><div class="stat-lbl">Consultas</div></div>
+          <div class="stat-box"><div class="stat-val" style="color:#f0c060">${notes.length}</div><div class="stat-lbl">Observações</div></div>
+        </div>
+      </div>
+
+      ${activeMeds.length?`<div class="card">
+        <div class="card-title">💊 Medicamentos em uso</div>
+        ${activeMeds.map(m=>`<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+          <span class="fw6">${m.name}</span> <span class="text-sub fs13"> · ${m.dose} · ${m.times}x ao dia</span>
+          ${m.notes?`<div class="text-muted fs12 italic">${m.notes}</div>`:""}
+        </div>`).join("")}
+      </div>`:""}
+
+      ${appts.length?`<div class="card">
+        <div class="card-title">🗓️ Consultas e compromissos</div>
+        ${appts.sort((a,b)=>a.date.localeCompare(b.date)).map(a=>`
+          <div style="padding:8px 0;border-bottom:1px solid var(--border)">
+            <span class="fw6">${a.type}</span>
+            <span class="text-sub fs13"> · ${fmtDateShort(a.date)}${a.time?" às "+a.time:""}</span>
+            ${a.professional?`<span class="text-muted fs12"> · ${a.professional}</span>`:""}
+          </div>`).join("")}
+      </div>`:""}
+
+      ${Object.keys(causeCounts).length?`<div class="card">
+        <div class="card-title">⚡ Gatilhos identificados</div>
+        ${Object.entries(causeCounts).sort((a,b)=>b[1]-a[1]).map(([cause,count])=>`
+          <div class="bar-wrap">
+            <div class="bar-label"><span>${cause}</span><span style="color:#e87c8a;font-weight:700">${count}x</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:${(count/crises.length)*100}%"></div></div>
+          </div>`).join("")}
+      </div>`:""}
+
+      ${crises.length?`<div class="card">
+        <div class="card-title">🌡️ Crises registradas</div>
+        ${crises.sort((a,b)=>a[0].localeCompare(b[0])).map(([dk,c])=>`
+          <div class="crisis-item">
+            <div class="row-between mb6"><span class="fw6">${fmtDate(dk)}</span>${badge(c.intensity,intensityColor(c.intensity))}</div>
+            ${c.causes?.length?`<div class="text-sub fs13">Gatilhos: ${c.causes.join(", ")}</div>`:""}
+            ${c.duration?`<div class="text-sub fs13">Duração: ${c.duration}</div>`:""}
+            ${c.postCrisis?`<div class="text-sub fs13">Pós-crise: ${c.postCrisis}</div>`:""}
+            ${c.note?`<div class="text-muted fs12 italic mt4">${c.note}</div>`:""}
+          </div>`).join("")}
+      </div>`:""}
+
+      ${notes.length?`<div class="card">
+        <div class="card-title">📝 Observações registradas</div>
+        ${notes.sort((a,b)=>b[0].localeCompare(a[0])).map(([,n])=>`
+          <div style="padding:10px 0;border-bottom:1px solid var(--border)">
+            <div class="row-gap8 mb6">${badge(n.category,"#5ecfbf")}<span class="text-muted fs12">${new Date(n.date).toLocaleDateString("pt-BR")}</span></div>
+            <div class="fs13">${n.text.replace(/\n/g,"<br>")}</div>
+          </div>`).join("")}
+      </div>`:""}
+
+      ${crises.length===0&&notes.length===0?`<div class="card" style="text-align:center;color:#5ecfbf;padding:40px">✨ Nenhuma ocorrência registrada neste período.</div>`:""}
+    `);
+  };
+
+  // ── AI ASSISTANT ─────────────────────────────────────────
+  function buildContext() {
+    const lines = [];
+    lines.push("=== DADOS DA MALU — CONTEXTO CLÍNICO ===\n");
+
+    // Meds
+    const activeMeds = (appData.meds||[]).filter(m=>m.status==="ativo");
+    if(activeMeds.length) {
+      lines.push("MEDICAMENTOS ATIVOS:");
+      activeMeds.forEach(m=>lines.push(`- ${m.name}: ${m.dose}, ${m.times}x ao dia${m.notes?" ("+m.notes+")":""}`));
+      lines.push("");
+    }
+
+    // Crises (últimas 60)
+    const crisesList = Object.entries(appData.crises||{}).sort((a,b)=>b[0].localeCompare(a[0])).slice(0,60);
+    if(crisesList.length) {
+      lines.push("CRISES REGISTRADAS (mais recentes primeiro):");
+      crisesList.forEach(([dk,c])=>lines.push(`- ${fmtDate(dk)}: ${c.intensity}${c.causes?.length?" | Gatilhos: "+c.causes.join(", "):""}${c.duration?" | Duração: "+c.duration:""}${c.postCrisis?" | Pós: "+c.postCrisis:""}${c.note?" | Obs: "+c.note:""}`));
+      lines.push("");
+    }
+
+    // Notes
+    const notesList = Object.entries(appData.notes||{}).sort((a,b)=>b[0].localeCompare(a[0])).slice(0,60);
+    if(notesList.length) {
+      lines.push("OBSERVAÇÕES:");
+      notesList.forEach(([,n])=>lines.push(`- [${n.category}] ${new Date(n.date).toLocaleDateString("pt-BR")}: ${n.text}`));
+      lines.push("");
+    }
+
+    // Appointments
+    const appts = (appData.appointments||[]).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,30);
+    if(appts.length) {
+      lines.push("CONSULTAS/COMPROMISSOS:");
+      appts.forEach(a=>lines.push(`- ${fmtDateShort(a.date)}: ${a.type}${a.professional?" com "+a.professional:""}${a.notes?" — "+a.notes:""}`));
+      lines.push("");
+    }
+
+    // Docs titles
+    const docs = appData.docs||[];
+    if(docs.length) {
+      lines.push("DOCUMENTOS ANEXADOS:");
+      docs.forEach(d=>lines.push(`- [${d.type}] ${d.title} (${fmtDateShort(d.date)})${d.desc?" — "+d.desc:""}`));
+      lines.push("");
+    }
+
+    return lines.join("\n");
+  }
+
+  window.sendAiMessage = async function() {
+    const input = el("ai-input");
+    const msg = input.value.trim(); if(!msg) return;
+    input.value = "";
+
+    chatHistory.push({ role:"user", content:msg });
+    renderChat();
+
+    const typingId = "typing-"+Date.now();
+    el("ai-messages").insertAdjacentHTML("beforeend",`<div id="${typingId}" class="chat-msg assistant"><div class="chat-bubble typing">...</div></div>`);
+    el("ai-messages").scrollTop = el("ai-messages").scrollHeight;
+
+    const context = buildContext();
+    const systemPrompt = `Você é uma assistente de saúde especializada em apoio a familiares de adolescentes em acompanhamento clínico.
+Você tem acesso ao histórico completo da Malu, uma adolescente de 14 anos em processo de internação/pós-alta com crises de agressividade.
+Use os dados abaixo para responder perguntas da mãe/cuidadora de forma clara, empática e útil.
+Responda SEMPRE em português brasileiro. Seja objetiva mas acolhedora.
+Se não encontrar a informação nos dados, diga claramente.
+Nunca forneça diagnósticos médicos — você é suporte informativo.
+
+${context}`;
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          model:"claude-sonnet-4-20250514",
+          max_tokens:1000,
+          system: systemPrompt,
+          messages: chatHistory.slice(-10),
+        })
+      });
+      const data = await res.json();
+      const reply = data.content?.[0]?.text || "Desculpe, não consegui processar.";
+      chatHistory.push({ role:"assistant", content:reply });
+      document.getElementById(typingId)?.remove();
+      renderChat();
+    } catch(e) {
+      document.getElementById(typingId)?.remove();
+      chatHistory.push({ role:"assistant", content:"Erro ao conectar com a IA. Tente novamente." });
+      renderChat();
+    }
+  };
+
+  window.aiKeydown = e => { if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); sendAiMessage(); } };
+
+  function renderChat() {
+    const msgs = el("ai-messages");
+    msgs.innerHTML = chatHistory.map(m=>`
+      <div class="chat-msg ${m.role}">
+        <div class="chat-bubble">${m.content.replace(/\n/g,"<br>")}</div>
+      </div>`).join("");
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  window.clearChat = () => { chatHistory=[]; renderChat(); };
+  window.aiSuggestion = q => { el("ai-input").value=q; sendAiMessage(); };
+
+  // ── USERS ────────────────────────────────────────────────
+  function roleLabel(r) { return r==="admin"?"⭐ Admin":r==="editor"?"✏️ Editor":"👁 Viewer"; }
+  function roleColor(r) { return r==="admin"?"#f0c060":r==="editor"?"#5ecfbf":"#8899bb"; }
+
+  async function renderUsers() {
+    if (!isAdmin()) {
+      hide("users-card"); hide("users-tip");
+      show("users-noaccess","block");
+      return;
+    }
+    show("users-card"); show("users-tip");
+    hide("users-noaccess");
+
+    let users = {};
+    if (!IS_CONFIGURED) {
+      users = JSON.parse(localStorage.getItem("malu_users_v2")||"{}");
+      Object.keys(users).forEach(k => users[k].uid = k);
+    } else {
+      try {
+        const snap = await getDocs(collection(db,"malu","users"));
+        snap.forEach(d => users[d.id] = {...d.data(), uid:d.id});
+      } catch(e) { console.warn("Users load:", e); }
+    }
+
+    const pending  = Object.values(users).filter(u=>!u.approved);
+    const approved = Object.values(users).filter(u=>u.approved);
+
+    let html = "";
+    if (pending.length) {
+      html += `<div style="margin-bottom:16px">
+        <div style="font-size:12px;font-weight:700;color:#e87c8a;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">⏳ Aguardando aprovação (${pending.length})</div>
+        ${pending.map(u=>`
+          <div class="user-row">
+            <div><div class="fw6">${u.name||"Sem nome"}</div><div class="text-muted fs12">${u.email||u.uid}</div></div>
+            <div class="row-gap8">
+              <button class="btn-primary btn-sm" onclick="approveUser('${u.uid}','editor')">Aprovar como Editor</button>
+              <button class="btn-secondary btn-sm" onclick="approveUser('${u.uid}','viewer')">Aprovar como Viewer</button>
+              <button class="btn-danger" onclick="rejectUser('${u.uid}')">Recusar</button>
+            </div>
+          </div>`).join("")}
+      </div>`;
+    }
+    html += `<div>
+      <div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Usuários aprovados</div>
+      ${approved.length ? approved.map(u=>`
+        <div class="user-row">
+          <div><div class="fw6">${u.name||"Sem nome"}</div><div class="text-muted fs12">${u.email||u.uid}</div></div>
+          <div class="row-gap8">
+            ${badge(roleLabel(u.role), roleColor(u.role))}
+            ${u.uid!==currentUser.uid?`
+              <select class="btn-secondary btn-sm" style="padding:5px 8px;font-size:11px" onchange="changeRole('${u.uid}',this.value)">
+                <option value="viewer" ${u.role==="viewer"?"selected":""}>Viewer</option>
+                <option value="editor" ${u.role==="editor"?"selected":""}>Editor</option>
+                <option value="admin"  ${u.role==="admin" ?"selected":""}>Admin</option>
+              </select>
+              <button class="btn-danger" onclick="removeUser('${u.uid}')">✕</button>` : "<span style='font-size:11px;color:var(--muted)'>(você)</span>"}
+          </div>
+        </div>`).join("") : "<div class='text-muted fs13'>Nenhum usuário aprovado ainda.</div>"}
+    </div>`;
+
+    set("users-card", `<div class="card">${html}</div>`);
+  }
+
+  window.approveUser = async function(uid, role) {
+    if (!IS_CONFIGURED) {
+      const users=JSON.parse(localStorage.getItem("malu_users_v2")||"{}");
+      if(users[uid]) { users[uid].approved=true; users[uid].role=role; }
+      localStorage.setItem("malu_users_v2",JSON.stringify(users));
+    } else {
+      try { await setDoc(doc(db,"malu","users",uid),{approved:true,role},{merge:true}); } catch(e){console.warn(e);}
+    }
+    renderUsers();
+  };
+  window.rejectUser = async function(uid) {
+    if (!IS_CONFIGURED) {
+      const users=JSON.parse(localStorage.getItem("malu_users_v2")||"{}");
+      delete users[uid]; localStorage.setItem("malu_users_v2",JSON.stringify(users));
+    } else {
+      try { await deleteDoc(doc(db,"malu","users",uid)); } catch(e){console.warn(e);}
+    }
+    renderUsers();
+  };
+  window.changeRole = async function(uid, role) {
+    if (!IS_CONFIGURED) {
+      const users=JSON.parse(localStorage.getItem("malu_users_v2")||"{}");
+      if(users[uid]) users[uid].role=role;
+      localStorage.setItem("malu_users_v2",JSON.stringify(users));
+    } else {
+      try { await setDoc(doc(db,"malu","users",uid),{role},{merge:true}); } catch(e){console.warn(e);}
+    }
+    renderUsers();
+  };
+  window.removeUser = async function(uid) {
+    if(uid===currentUser.uid) return;
+    if (!IS_CONFIGURED) {
+      const users=JSON.parse(localStorage.getItem("malu_users_v2")||"{}");
+      delete users[uid]; localStorage.setItem("malu_users_v2",JSON.stringify(users));
+    } else {
+      try { await deleteDoc(doc(db,"malu","users",uid)); } catch(e){console.warn(e);}
+    }
+    renderUsers();
+  };
+
+  // ── LOGIN MODE TOGGLE ────────────────────────────────────
+  window.setMode = mode => {
+    el("reg-name-group").style.display = mode==="register"?"block":"none";
+    el("reg-hint").style.display       = mode==="register"?"block":"none";
+    el("login-action-btn").textContent = mode==="register"?"Criar conta":"Entrar";
+    el("login-action-btn").onclick     = mode==="register"?doRegister:doLogin;
+    document.querySelectorAll(".mode-btn").forEach((b,i)=>
+      b.classList.toggle("active",(i===0&&mode==="login")||(i===1&&mode==="register")));
+    hide("login-err");
+  };
+
+  // ── INIT ─────────────────────────────────────────────────
+  window.addEventListener("DOMContentLoaded", () => {
+    initAuth();
+    // report selects
+    const ms=el("rep-month");
+    if(ms&&!ms.options.length){ MONTHS_PT.forEach((m,i)=>ms.appendChild(new Option(m,i))); ms.value=now.getMonth(); }
+    // shift date default
+    const sd=el("shift-date"); if(sd) sd.value=new Date().toISOString().split("T")[0];
+    const ad=el("appt-date"); if(ad) ad.value="";
+  });
+</script>
+
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0e18;--card:#13172200;--card-solid:#131722;--card2:#1a1f2e;
+  --border:#252c44;--teal:#5ecfbf;--rose:#e87c8a;--gold:#f0c060;
+  --violet:#a78bfa;--muted:#5a6480;--text:#dde2f0;--sub:#8892b0;
+  --font:'DM Sans',sans-serif;--font-display:'DM Serif Display',serif;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;padding-bottom:60px}
+body::before{content:"";position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 20% 10%,#5ecfbf08,transparent),radial-gradient(ellipse 60% 40% at 80% 80%,#e87c8a06,transparent);pointer-events:none;z-index:0}
+
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* ── TOPBAR ── */
+#topbar{background:#0f1420ee;backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:8px}
+.logo{font-family:var(--font-display);font-size:19px;color:var(--teal);letter-spacing:.3px}
+.logo-sub{font-size:11px;color:var(--muted);margin-top:1px}
+#nav{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.nav-btn{padding:7px 13px;border-radius:20px;border:none;cursor:pointer;font-size:12px;font-weight:500;transition:all .2s;font-family:inherit;background:transparent;color:var(--sub)}
+.nav-btn.active{background:#5ecfbf18;color:var(--teal);box-shadow:0 0 0 1px #5ecfbf33}
+.nav-btn:hover:not(.active){color:var(--text);background:#ffffff08}
+
+/* ── PAGES ── */
+.page-tab{max-width:920px;margin:0 auto;padding:28px 20px;position:relative;z-index:1}
+.page-hidden{display:none!important}
+h1.ph{font-family:var(--font-display);font-size:26px;font-weight:400;margin-bottom:4px;font-style:italic;color:var(--text)}
+p.psub{color:var(--sub);font-size:14px;margin-bottom:24px}
+
+/* ── CARDS ── */
+.card{background:var(--card-solid);border:1px solid var(--border);border-radius:16px;padding:22px;margin-bottom:16px}
+.card-title{font-weight:600;margin-bottom:14px;font-size:14px;letter-spacing:.2px}
+
+/* ── CONFIG BANNER ── */
+#config-banner{background:#1a1505;border:1px solid #f0c06033;border-radius:12px;padding:14px 18px;margin:16px 20px;font-size:13px;color:#f0c060;display:none}
+#config-banner a{color:#f0c060;text-decoration:underline}
+
+/* ── BUTTONS ── */
+.btn-primary{padding:10px 22px;border-radius:10px;border:none;cursor:pointer;background:var(--teal);color:#0b0e18;font-weight:700;font-size:13px;font-family:inherit;transition:opacity .15s}
+.btn-primary:hover{opacity:.85}
+.btn-secondary{padding:10px 22px;border-radius:10px;border:1px solid var(--border);cursor:pointer;background:transparent;color:var(--sub);font-weight:500;font-size:13px;font-family:inherit;transition:all .15s}
+.btn-secondary:hover{border-color:var(--teal);color:var(--teal)}
+.btn-danger{padding:6px 12px;border-radius:8px;border:none;cursor:pointer;background:#3a1a1f;color:var(--rose);font-weight:600;font-size:12px;font-family:inherit;transition:opacity .15s}
+.btn-danger:hover{opacity:.8}
+.btn-sm{padding:6px 12px;font-size:12px}
+
+/* ── FORMS ── */
+label.lbl{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
+input[type=text],input[type=password],input[type=date],input[type=time],input[type=email],select,textarea{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--card2);color:var(--text);font-size:14px;outline:none;font-family:inherit;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--teal)}
+select{cursor:pointer}
+textarea{resize:vertical;min-height:80px}
+.form-group{margin-bottom:14px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.form-grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+
+/* ── TAGS ── */
+.tag{display:inline-block;padding:4px 11px;border-radius:20px;font-size:12px;font-weight:500;background:var(--border);color:var(--sub);margin:0 4px 6px 0;cursor:pointer;border:1px solid transparent;transition:all .15s}
+.tag.active{background:#5ecfbf18;color:var(--teal);border-color:#5ecfbf33}
+.tag:hover:not(.active){color:var(--text)}
+
+/* ── BADGE ── */
+.badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
+
+/* ── STATS ── */
+.stats-strip{display:flex;gap:10px;flex-wrap:wrap}
+.stat-box{flex:1;min-width:80px;background:var(--card2);border-radius:12px;padding:14px 16px;border:1px solid var(--border)}
+.stat-val{font-size:26px;font-weight:700}
+.stat-lbl{font-size:11px;color:var(--muted);margin-top:2px}
+
+/* ── CALENDAR ── */
+.cal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.cal-month{font-family:var(--font-display);font-size:20px;font-style:italic}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.cal-dow{text-align:center;font-size:11px;font-weight:600;color:var(--muted);padding:4px 0}
+.cal-day{aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:10px;cursor:pointer;position:relative;font-size:13px;font-weight:500;transition:all .15s;color:var(--sub);border:1px solid transparent}
+.cal-day:hover{background:var(--border)!important}
+.cal-day.other-month{color:var(--border);cursor:default}
+.cal-day.other-month:hover{background:transparent!important}
+.cal-day.has-crisis{background:#e87c8a18;color:var(--rose)}
+.cal-day.is-today{background:#5ecfbf18;color:var(--teal);border-color:#5ecfbf33}
+.cal-dots{display:flex;gap:2px;position:absolute;bottom:4px}
+.cal-dot{width:5px;height:5px;border-radius:50%}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:16px}
+.legend-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub)}
+.legend-dot{width:8px;height:8px;border-radius:50%}
+
+/* ── MODAL ── */
+#modal-overlay{position:fixed;inset:0;background:#00000099;display:none;align-items:center;justify-content:center;z-index:200;padding:16px}
+#modal-overlay.open{display:flex}
+#modal-box{background:var(--card-solid);border:1px solid var(--border);border-radius:20px;padding:26px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto;box-shadow:0 40px 100px #00000088}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+.modal-title{font-family:var(--font-display);font-size:20px;font-style:italic}
+
+/* ── CRISIS ── */
+.crisis-item{border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:12px}
+.crisis-item:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+
+/* ── MED ── */
+.med-item{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:12px}
+.med-item:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.med-dim{opacity:.5}
+
+/* ── DOCS ── */
+.doc-item{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)}
+.doc-item:last-child{border-bottom:none}
+.doc-icon{font-size:24px;flex-shrink:0}
+.doc-info{flex:1}
+
+/* ── SHIFTS ── */
+.shifts-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.shift-turn{border-radius:12px;padding:14px;border:1px solid var(--border)}
+.shift-turn-label{font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
+.shift-person{font-weight:600;font-size:15px;color:var(--text)}
+.shift-note{font-size:12px;color:var(--sub);margin-top:4px;font-style:italic}
+.shift-filled{background:#5ecfbf0a;border-color:#5ecfbf22}
+.shift-empty{background:var(--card2)}
+
+/* ── APPOINTMENTS ── */
+.appt-item{display:flex;align-items:flex-start;gap:16px;padding:14px 0;border-bottom:1px solid var(--border)}
+.appt-item:last-child{border-bottom:none}
+.appt-date-col{text-align:center;min-width:48px;background:var(--card2);border-radius:10px;padding:8px 6px}
+.appt-day{font-size:22px;font-weight:700;line-height:1}
+.appt-mon{font-size:11px;color:var(--muted);text-transform:uppercase;margin-top:2px}
+.appt-time{font-size:11px;color:var(--teal);margin-top:4px;font-weight:600}
+.appt-info{flex:1}
+.appt-past{opacity:.5}
+
+/* ── REPORT ── */
+.bar-wrap{margin-bottom:10px}
+.bar-label{display:flex;justify-content:space-between;margin-bottom:4px;font-size:13px}
+.bar-track{height:5px;border-radius:3px;background:var(--border)}
+.bar-fill{height:100%;border-radius:3px;background:var(--rose);transition:width .3s}
+
+/* ── AI CHAT ── */
+.ai-wrap{display:flex;flex-direction:column;height:calc(100vh - 140px);min-height:500px}
+#ai-messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.chat-msg{display:flex}
+.chat-msg.user{justify-content:flex-end}
+.chat-msg.assistant{justify-content:flex-start}
+.chat-bubble{max-width:75%;padding:12px 16px;border-radius:16px;font-size:14px;line-height:1.6}
+.chat-msg.user .chat-bubble{background:#5ecfbf22;color:var(--teal);border:1px solid #5ecfbf33;border-radius:16px 16px 4px 16px}
+.chat-msg.assistant .chat-bubble{background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:16px 16px 16px 4px}
+.typing{animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+.ai-input-bar{display:flex;gap:8px;padding:16px 20px;background:#0f1420;border-top:1px solid var(--border);position:sticky;bottom:0}
+.ai-input-bar textarea{min-height:44px;max-height:120px;resize:none;flex:1;border-radius:12px}
+.ai-suggestions{padding:12px 20px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border);background:#0b0e18}
+.ai-sugg-btn{padding:6px 13px;border-radius:20px;background:var(--card2);border:1px solid var(--border);color:var(--sub);font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s}
+.ai-sugg-btn:hover{border-color:var(--teal);color:var(--teal)}
+
+/* ── LOGIN ── */
+#login-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;position:relative;z-index:1}
+.login-box{background:var(--card-solid);border:1px solid var(--border);border-radius:20px;padding:36px;width:100%;max-width:400px;box-shadow:0 40px 80px #00000066}
+.login-logo{text-align:center;margin-bottom:30px}
+.login-emoji{font-size:40px;margin-bottom:10px}
+.login-title{font-family:var(--font-display);font-size:28px;font-style:italic;color:var(--teal);margin-bottom:4px}
+.login-subtitle{color:var(--sub);font-size:13px}
+.mode-toggle{display:flex;gap:8px;margin-bottom:22px}
+.mode-btn{flex:1;padding:9px;border-radius:20px;border:none;cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;transition:all .2s;background:transparent;color:var(--sub)}
+.mode-btn.active{background:#5ecfbf18;color:var(--teal);box-shadow:0 0 0 1px #5ecfbf33}
+
+/* ── USERS ── */
+.user-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)}
+
+/* ── UTILS ── */
+.row-between{display:flex;justify-content:space-between;align-items:center}
+.row-gap6{display:flex;gap:6px;align-items:center}
+.row-gap8{display:flex;gap:8px;align-items:center}
+.mb4{margin-bottom:4px}.mb6{margin-bottom:6px}.mb8{margin-bottom:8px}.mb16{margin-bottom:16px}.mt4{margin-top:4px}
+.fw6{font-weight:600}.fw7{font-weight:700}.fs12{font-size:12px}.fs13{font-size:13px}.fs16{font-size:16px}
+.text-sub{color:var(--sub)}.text-muted{color:var(--muted)}.italic{font-style:italic}
+.note-text{font-size:14px;line-height:1.65}
+
+@media(max-width:600px){
+  .form-grid,.form-grid-3,.shifts-grid{grid-template-columns:1fr}
+  #topbar{padding:10px 14px}.page-tab{padding:18px 14px}
+  .nav-btn{padding:7px 9px;font-size:11px}
+  .chat-bubble{max-width:88%}
+}
+@media print{
+  #topbar,.no-print,#modal-overlay{display:none!important}
+  body{background:white;color:black}
+  .card{border:1px solid #ddd;background:white}
+}
+</style>
+</head>
+<body>
+
+<!-- CONFIG BANNER -->
+<div id="config-banner">
+  ⚠️ <strong>Modo demonstração:</strong> os dados ficam apenas neste dispositivo. 
+  Para ativar a nuvem, <a href="#" onclick="el('tab-users')">configure o Firebase</a> com suas credenciais no início do arquivo.
+</div>
+
+<!-- LOGIN -->
+<div id="login-screen">
+  <div class="login-box">
+    <div class="login-logo">
+      <div class="login-emoji">🌿</div>
+      <div class="login-title">Diário da Malu</div>
+      <div class="login-subtitle">Acompanhamento clínico e emocional</div>
+    </div>
+    <div class="mode-toggle">
+      <button class="mode-btn active" onclick="setMode('login')">Entrar</button>
+      <button class="mode-btn" onclick="setMode('register')">Criar conta</button>
+    </div>
+    <div id="reg-name-group" class="form-group" style="display:none">
+      <label class="lbl">Nome completo</label>
+      <input type="text" id="inp-name" placeholder="Seu nome">
+    </div>
+    <div class="form-group">
+      <label class="lbl">Email / Usuário</label>
+      <input type="text" id="inp-user" placeholder="seu@email.com">
+    </div>
+    <div class="form-group" style="margin-bottom:20px">
+      <label class="lbl">Senha</label>
+      <input type="password" id="inp-pass" placeholder="••••••" onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+    <div id="login-err" style="font-size:13px;margin-bottom:12px;display:none"></div>
+    <button id="login-action-btn" class="btn-primary" style="width:100%" onclick="doLogin()">Entrar</button>
+    <div id="reg-hint" style="color:var(--muted);font-size:11px;margin-top:10px;text-align:center;display:none">
+      Conta criada! Entre com seu usuário e senha.
+    </div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app" style="display:none">
+  <div id="pending-banner" style="display:none;background:#2a0a10;border-bottom:1px solid #e87c8a44;padding:10px 24px;font-size:13px;color:#e87c8a;text-align:center">
+    ⏳ Sua conta está aguardando aprovação do administrador. Você pode visualizar os dados mas não pode editar até ser aprovado.
+  </div>
+  <div id="topbar">
+    <div>
+      <div class="logo">🌿 Diário da Malu</div>
+      <div class="logo-sub" id="hello-name"></div>
+      <div id="user-role-badge" style="font-size:11px;margin-top:1px"></div>
+    </div>
+    <div id="nav">
+      <button class="nav-btn active" data-tab="calendar" onclick="switchTab('calendar')">📅 Calendário</button>
+      <button class="nav-btn" data-tab="meds" onclick="switchTab('meds')">💊 Medicamentos</button>
+      <button class="nav-btn" data-tab="notes" onclick="switchTab('notes')">📝 Notas</button>
+      <button class="nav-btn" data-tab="docs" onclick="switchTab('docs')">📎 Documentos</button>
+      <button class="nav-btn" data-tab="shifts" onclick="switchTab('shifts')">👤 Plantão</button>
+      <button class="nav-btn" data-tab="appointments" onclick="switchTab('appointments')">🗓️ Agenda</button>
+      <button class="nav-btn" data-tab="ai" onclick="switchTab('ai')">🤖 Assistente</button>
+      <button class="nav-btn" data-tab="report" onclick="switchTab('report')">📊 Relatório</button>
+      <button class="nav-btn" data-tab="users" onclick="switchTab('users')">👥 Acesso</button>
+      <button class="btn-secondary btn-sm no-print" onclick="doLogout()">Sair</button>
+    </div>
+  </div>
+
+  <!-- CALENDAR -->
+  <div id="tab-calendar" class="page-tab">
+    <h1 class="ph">Calendário de Acompanhamento</h1>
+    <p class="psub">Clique em qualquer dia para registrar uma crise</p>
+    <div class="card">
+      <div class="cal-header">
+        <button class="btn-secondary btn-sm" onclick="calPrev()">‹</button>
+        <div class="cal-month" id="cal-title"></div>
+        <button class="btn-secondary btn-sm" onclick="calNext()">›</button>
+      </div>
+      <div class="stats-strip mb16" id="cal-stats"></div>
+      <div class="cal-grid mb16" id="cal-dow"></div>
+      <div class="cal-grid" id="cal-cells"></div>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#ff5566"></div>Crise muito intensa</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--rose)"></div>Intensa</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--gold)"></div>Moderada</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#8899bb"></div>Leve</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#a78bfa"></div>Compromisso</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--teal);opacity:.6"></div>Plantão</div>
+      </div>
+    </div>
+    <div id="cal-crisis-list"></div>
+  </div>
+
+  <!-- MEDS -->
+  <div id="tab-meds" class="page-tab page-hidden">
+    <div class="row-between mb16" style="flex-wrap:wrap;gap:10px">
+      <div><h1 class="ph">Medicamentos</h1><p class="psub" style="margin-bottom:0">Histórico e dosagens</p></div>
+      <button class="btn-primary no-print edit-only" onclick="toggleMedForm()">+ Adicionar</button>
+    </div>
+    <div id="med-form" class="card" style="display:none;border-color:#5ecfbf33">
+      <div class="card-title" id="med-form-title">Novo medicamento</div>
+      <div class="form-grid">
+        <div class="form-group"><label class="lbl">Nome</label><input type="text" id="med-name" placeholder="Ex: Risperidona"></div>
+        <div class="form-group"><label class="lbl">Dosagem</label><input type="text" id="med-dose" placeholder="Ex: 0,5 mg"></div>
+        <div class="form-group"><label class="lbl">Vezes ao dia</label>
+          <select id="med-times"><option value="1">1x</option><option value="2">2x</option><option value="3">3x</option><option value="4">4x</option><option value="Conforme necessário">Conforme necessário</option></select>
+        </div>
+        <div class="form-group"><label class="lbl">Data de início</label><input type="date" id="med-start"></div>
+        <div class="form-group"><label class="lbl">Status</label>
+          <select id="med-status"><option value="ativo">Ativo</option><option value="suspenso">Suspenso</option><option value="encerrado">Encerrado</option></select>
+        </div>
+      </div>
+      <div class="form-group"><label class="lbl">Observações / motivo de alteração</label>
+        <textarea id="med-notes" placeholder="Ex: dose aumentada em 15/04, efeitos colaterais..."></textarea>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="btn-secondary" onclick="cancelMedForm()">Cancelar</button>
+        <button class="btn-primary" onclick="saveMed()">Salvar</button>
+      </div>
+    </div>
+    <div id="meds-active"></div>
+    <div id="meds-inactive"></div>
+    <div id="meds-empty" class="card" style="text-align:center;color:var(--muted);padding:40px">Nenhum medicamento registrado.</div>
+  </div>
+
+  <!-- NOTES -->
+  <div id="tab-notes" class="page-tab page-hidden">
+    <h1 class="ph">Notas e Observações</h1>
+    <p class="psub">Registros livres do dia a dia</p>
+    <div class="card no-print">
+      <div id="note-cats" style="margin-bottom:12px"></div>
+      <div class="form-group"><textarea id="note-text" placeholder="Escreva uma observação..."></textarea></div>
+      <button class="btn-primary edit-only" onclick="addNote()">Salvar nota</button>
+    </div>
+    <div id="notes-list"></div>
+  </div>
+
+  <!-- DOCS -->
+  <div id="tab-docs" class="page-tab page-hidden">
+    <div class="row-between mb16" style="flex-wrap:wrap;gap:10px">
+      <div><h1 class="ph">Documentos</h1><p class="psub" style="margin-bottom:0">Laudos, receitas, testes e exames</p></div>
+      <button class="btn-primary no-print edit-only" onclick="el('doc-form').style.display=el('doc-form').style.display==='none'?'block':'none'">+ Anexar</button>
+    </div>
+    <div id="doc-form" class="card" style="display:none;border-color:#a78bfa33">
+      <div class="card-title">Novo documento</div>
+      <div class="form-grid">
+        <div class="form-group"><label class="lbl">Tipo</label>
+          <select id="doc-type">${['Laudo médico','Receita','Teste neuropsicológico','Relatório escolar','Exame','Prescrição','Outro'].map(t=>`<option>${t}</option>`).join("")}</select>
+        </div>
+        <div class="form-group"><label class="lbl">Data do documento</label><input type="date" id="doc-date"></div>
+        <div class="form-group" style="grid-column:1/-1"><label class="lbl">Título / descrição</label><input type="text" id="doc-title" placeholder="Ex: Laudo neuropediatria Dra. Ana"></div>
+      </div>
+      <div class="form-group"><label class="lbl">Observação</label><input type="text" id="doc-desc" placeholder="Informação adicional (opcional)"></div>
+      <div class="form-group"><label class="lbl">Arquivo (PDF ou imagem)</label><input type="file" id="doc-file" accept=".pdf,.jpg,.jpeg,.png" style="background:var(--card2);border:1px dashed var(--border);padding:14px"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="btn-secondary" onclick="el('doc-form').style.display='none'">Cancelar</button>
+        <button class="btn-primary" id="doc-upload-btn" onclick="handleDocUpload()">Anexar arquivo</button>
+      </div>
+    </div>
+    <div id="docs-list"></div>
+    <div id="docs-empty" class="card" style="text-align:center;color:var(--muted);padding:40px">
+      📎 Nenhum documento anexado ainda.<br><span class="fs12">Adicione laudos, receitas e exames aqui.</span>
+    </div>
+  </div>
+
+  <!-- SHIFTS (PLANTÃO) -->
+  <div id="tab-shifts" class="page-tab page-hidden">
+    <h1 class="ph">Quadro de Plantão</h1>
+    <p class="psub">Registro de quem acompanhou a Malu em cada turno</p>
+    <div class="card no-print" style="border-color:#5ecfbf22">
+      <div class="card-title">Registrar presença</div>
+      <div class="form-grid">
+        <div class="form-group"><label class="lbl">Data</label><input type="date" id="shift-date"></div>
+        <div class="form-group"><label class="lbl">Turno</label>
+          <select id="shift-turn"><option>Manhã</option><option>Tarde</option><option>Noite</option></select>
+        </div>
+        <div class="form-group" style="grid-column:1/-1"><label class="lbl">Responsável presente</label>
+          <input type="text" id="shift-person" placeholder="Nome de quem ficou com a Malu">
+        </div>
+      </div>
+      <div class="form-group"><label class="lbl">Observações do turno</label>
+        <textarea id="shift-notes" placeholder="Como foi o período? Algo relevante..." style="min-height:60px"></textarea>
+      </div>
+      <button class="btn-primary edit-only" onclick="saveShift()">Salvar plantão</button>
+    </div>
+    <div id="shifts-list"></div>
+  </div>
+
+  <!-- APPOINTMENTS -->
+  <div id="tab-appointments" class="page-tab page-hidden">
+    <div class="row-between mb16" style="flex-wrap:wrap;gap:10px">
+      <div><h1 class="ph">Agenda</h1><p class="psub" style="margin-bottom:0">Consultas, terapias e compromissos</p></div>
+      <button class="btn-primary no-print edit-only" onclick="el('appt-form').style.display=el('appt-form').style.display==='none'?'block':'none'">+ Agendar</button>
+    </div>
+    <div id="appt-form" class="card" style="display:none;border-color:#a78bfa33">
+      <div class="card-title">Novo compromisso</div>
+      <div class="form-grid">
+        <div class="form-group"><label class="lbl">Tipo</label>
+          <select id="appt-type">${['Consulta médica','Terapia','Psicologia','Neurologia','Psiquiatria','Escola','Exame','Outro'].map(t=>`<option>${t}</option>`).join("")}</select>
+        </div>
+        <div class="form-group"><label class="lbl">Data</label><input type="date" id="appt-date"></div>
+        <div class="form-group"><label class="lbl">Horário</label><input type="time" id="appt-time"></div>
+        <div class="form-group"><label class="lbl">Profissional</label><input type="text" id="appt-prof" placeholder="Nome do profissional"></div>
+        <div class="form-group" style="grid-column:1/-1"><label class="lbl">Local / endereço</label><input type="text" id="appt-loc" placeholder="Clínica, hospital, endereço..."></div>
+      </div>
+      <div class="form-group"><label class="lbl">Observações</label>
+        <textarea id="appt-anotes" placeholder="O que discutir, levar, fazer antes..." style="min-height:60px"></textarea>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="btn-secondary" onclick="el('appt-form').style.display='none'">Cancelar</button>
+        <button class="btn-primary edit-only" onclick="saveAppointment()">Salvar</button>
+      </div>
+    </div>
+    <div class="card" id="appts-upcoming-card">
+      <div class="card-title" style="color:var(--teal)">Próximos compromissos</div>
+      <div id="appts-upcoming"></div>
+    </div>
+    <div id="appts-past"></div>
+  </div>
+
+  <!-- AI -->
+  <div id="tab-ai" class="page-tab page-hidden" style="padding:0;max-width:100%">
+    <div class="ai-wrap">
+      <div style="padding:20px 24px;background:#0f1420;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-family:var(--font-display);font-size:20px;font-style:italic">🤖 Assistente da Malu</div>
+          <div class="text-muted fs12">Pergunte sobre crises, medicamentos, padrões ou qualquer dado registrado</div>
+        </div>
+        <button class="btn-secondary btn-sm" onclick="clearChat()">Limpar conversa</button>
+      </div>
+      <div class="ai-suggestions no-print">
+        <button class="ai-sugg-btn" onclick="aiSuggestion('Quais foram os gatilhos mais frequentes nas últimas crises?')">Gatilhos frequentes</button>
+        <button class="ai-sugg-btn" onclick="aiSuggestion('Qual é a medicação atual da Malu e para que serve cada uma?')">Medicação atual</button>
+        <button class="ai-sugg-btn" onclick="aiSuggestion('Como foram as últimas semanas? Houve melhora ou piora?')">Evolução recente</button>
+        <button class="ai-sugg-btn" onclick="aiSuggestion('Quais consultas estão agendadas?')">Próximas consultas</button>
+        <button class="ai-sugg-btn" onclick="aiSuggestion('Faça um resumo do histórico da Malu para eu mostrar ao médico.')">Resumo para médico</button>
+        <button class="ai-sugg-btn" onclick="aiSuggestion('Em que dias da semana costumam ocorrer mais crises?')">Padrão por dia</button>
+      </div>
+      <div id="ai-messages" style="padding:20px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;flex:1">
+        <div class="chat-msg assistant">
+          <div class="chat-bubble">
+            Olá! 💙 Sou a assistente do Diário da Malu. Tenho acesso a todos os dados registrados — crises, medicamentos, notas, consultas e documentos.<br><br>
+            Pode me perguntar qualquer coisa, como <em>"quais foram os gatilhos mais comuns?"</em> ou <em>"faça um resumo para levar ao médico"</em>.
+          </div>
+        </div>
+      </div>
+      <div class="ai-input-bar no-print">
+        <textarea id="ai-input" placeholder="Pergunte sobre a Malu..." rows="1" onkeydown="aiKeydown(event)"></textarea>
+        <button class="btn-primary" onclick="sendAiMessage()" style="flex-shrink:0">Enviar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- REPORT -->
+  <div id="tab-report" class="page-tab page-hidden">
+    <div class="row-between mb16" style="flex-wrap:wrap;gap:10px">
+      <div><h1 class="ph">Relatório</h1><p class="psub" style="margin-bottom:0">Resumo por período</p></div>
+      <button class="btn-primary no-print" onclick="window.print()">🖨 Imprimir</button>
+    </div>
+    <div class="card no-print">
+      <div class="form-grid">
+        <div class="form-group"><label class="lbl">Modo</label>
+          <select id="rep-mode" onchange="toggleRepMode()">
+            <option value="month">Por mês</option>
+            <option value="range">Período personalizado</option>
+          </select>
+        </div>
+      </div>
+      <div id="rep-month-sel" class="form-grid">
+        <div class="form-group"><label class="lbl">Mês</label><select id="rep-month" onchange="renderReport()"></select></div>
+        <div class="form-group"><label class="lbl">Ano</label>
+          <select id="rep-year" onchange="renderReport()"><option>2024</option><option>2025</option><option selected>2026</option><option>2027</option></select>
+        </div>
+      </div>
+      <div id="rep-range-sel" class="form-grid" style="display:none">
+        <div class="form-group"><label class="lbl">De</label><input type="date" id="rep-from" onchange="renderReport()"></div>
+        <div class="form-group"><label class="lbl">Até</label><input type="date" id="rep-to" onchange="renderReport()"></div>
+      </div>
+    </div>
+    <div id="rep-content"></div>
+  </div>
+
+  <!-- USERS -->
+  <div id="tab-users" class="page-tab page-hidden">
+    <h1 class="ph">Usuários e Acesso</h1>
+    <p class="psub">Gerencie quem acessa o diário da Malu</p>
+    <div id="users-card"></div>
+    <div id="users-tip" class="card" style="background:#0f1a14;border-color:#5ecfbf22">
+      <div class="fs13 text-sub">
+        💡 <strong>Para acesso na nuvem (qualquer dispositivo):</strong> configure o Firebase no arquivo HTML.<br><br>
+        <strong>⚠️ Regras do Firestore (obrigatório):</strong><br>
+        No console Firebase → Firestore → <strong>Regras</strong>, cole o código abaixo e clique em <strong>Publicar</strong>:<br><br>
+        <code style="display:block;background:#0a0f1a;padding:10px;border-radius:8px;font-size:11px;margin-top:6px;white-space:pre">rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /malu/data {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null &&
+        get(/databases/$(database)/documents/malu/users/$(request.auth.uid)).data.approved == true &&
+        get(/databases/$(database)/documents/malu/users/$(request.auth.uid)).data.role in ['admin','editor'];
+    }
+    match /malu/users/{uid} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && (
+        request.auth.uid == uid ||
+        get(/databases/$(database)/documents/malu/users/$(request.auth.uid)).data.role == 'admin'
+      );
+    }
+  }
+}</code>
+      </div>
+    </div>
+    <div id="users-noaccess" style="display:none;text-align:center;padding:40px;color:var(--muted)">Apenas administradores podem gerenciar usuários.</div>
+  </div>
+</div>
+
+<!-- CRISIS MODAL -->
+<div id="modal-overlay" onclick="closeModalOutside(event)">
+  <div id="modal-box">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="modal-date-title"></div>
+        <div class="text-sub fs13">Registro de crise</div>
+      </div>
+      <button class="btn-secondary btn-sm" onclick="closeModal()">✕</button>
+    </div>
+    <div class="form-group"><label class="lbl">Intensidade</label><div id="modal-intensity"></div></div>
+    <div class="form-group"><label class="lbl">Gatilhos / Causas</label><div id="modal-causes"></div></div>
+    <div class="form-group"><label class="lbl">Duração aproximada</label><input type="text" id="modal-duration" placeholder="Ex: 20 minutos"></div>
+    <div class="form-group"><label class="lbl">Técnicas usadas</label><input type="text" id="modal-techniques" placeholder="Ex: frases curtas do manual, afastamento..."></div>
+    <div class="form-group"><label class="lbl">Como ficou após a crise</label>
+      <select id="modal-post">
+        <option value="">Selecione...</option>
+        <option>Acalmou rapidamente</option><option>Demorou para acalmar</option>
+        <option>Ficou isolada</option><option>Conversou depois</option>
+        <option>Dormiu</option><option>Ficou irritada o dia todo</option>
+      </select>
+    </div>
+    <div class="form-group"><label class="lbl">Observações livres</label>
+      <textarea id="modal-note" placeholder="O que aconteceu, o que ajudou, o que piorou..."></textarea>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button id="modal-delete-btn" class="btn-danger" onclick="deleteCrisis()" style="display:none">Remover</button>
+      <button class="btn-secondary" onclick="closeModal()">Cancelar</button>
+      <button class="btn-primary" onclick="saveCrisis()">Salvar</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── REPORT MODE TOGGLE ──────────────────────────────────
+function toggleRepMode() {
+  const mode = document.getElementById("rep-mode").value;
+  document.getElementById("rep-month-sel").style.display  = mode==="month"?"grid":"none";
+  document.getElementById("rep-range-sel").style.display  = mode==="range"?"grid":"none";
+  renderReport();
+}
+</script>
+</body>
+</html>
